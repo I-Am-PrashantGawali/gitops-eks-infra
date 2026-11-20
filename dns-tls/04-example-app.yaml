@@ -1,0 +1,102 @@
+# Example: deploy an app with automatic DNS + TLS cert
+# Replace REPLACE_DOMAIN_NAME with your actual domain e.g. myapp.example.com
+#
+# What happens after kubectl apply:
+#  1. ALB controller sees the Ingress -> provisions an ALB
+#  2. External DNS sees the ALB hostname -> creates an A record in Route53
+#  3. cert-manager sees the Certificate -> does DNS-01 challenge -> gets cert from Let's Encrypt
+#  4. ALB controller attaches the cert to the ALB listener
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+---
+# The TLS certificate — cert-manager watches this and handles everything
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: myapp-tls
+  namespace: app
+spec:
+  secretName: myapp-tls-secret          # cert stored in this K8s Secret
+  issuerRef:
+    name: letsencrypt-staging            # use letsencrypt-prod once staging works
+    kind: ClusterIssuer
+  dnsNames:
+    - REPLACE_DOMAIN_NAME                # e.g. myapp.example.com
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: myapp
+          image: nginx:alpine              # replace with your ECR image
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+  namespace: app
+spec:
+  selector:
+    app: myapp
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+# Ingress — ALB controller + External DNS + cert-manager all react to this
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp
+  namespace: app
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    # cert-manager puts the cert in this secret; ALB controller reads it
+    alb.ingress.kubernetes.io/certificate-arn: ""   # leave blank — ALB controller picks up from tls: block
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # External DNS reads this annotation to know what DNS name to create
+    external-dns.alpha.kubernetes.io/hostname: REPLACE_DOMAIN_NAME
+spec:
+  tls:
+    - hosts:
+        - REPLACE_DOMAIN_NAME
+      secretName: myapp-tls-secret        # same secret as Certificate above
+  rules:
+    - host: REPLACE_DOMAIN_NAME
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 80

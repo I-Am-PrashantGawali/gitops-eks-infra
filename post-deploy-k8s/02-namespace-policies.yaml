@@ -1,0 +1,92 @@
+# Namespace + baseline policies for a production workload namespace
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+  labels:
+    environment: production
+    pod-security.kubernetes.io/enforce: restricted      # K8s built-in Pod Security Standards
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# Default deny-all NetworkPolicy — whitelist traffic explicitly
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: app
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Allow DNS egress (CoreDNS on port 53)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: app
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# Allow ingress from the ALB (by security group tag in real setup, here by namespace)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-alb
+  namespace: app
+spec:
+  podSelector:
+    matchLabels:
+      expose: public
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8080
+          protocol: TCP
+---
+# LimitRange: prevent unbounded resource consumption
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: app
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: '4'
+        memory: 4Gi
+---
+# ResourceQuota: cap total namespace consumption
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: app
+spec:
+  hard:
+    requests.cpu: '20'
+    requests.memory: 40Gi
+    limits.cpu: '40'
+    limits.memory: 80Gi
+    pods: '100'
+    services: '20'
+    persistentvolumeclaims: '20'

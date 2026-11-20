@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EKS Managed Node Group — single group, t3.medium, 1-2 nodes.
+  Cost-optimised for small/dev-prod workloads.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+  KubernetesVersion:
+    Type: String
+    Default: '1.32'
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium          # 2 vCPU / 4 GB RAM — ~$30/month each
+    AllowedValues:
+      - t3.small                # 2 vCPU / 2 GB  — ~$15/month (tight for EKS system pods)
+      - t3.medium               # 2 vCPU / 4 GB  — recommended minimum
+      - t3.large                # 2 vCPU / 8 GB  — if you need more memory
+      - t3a.medium              # AMD, same spec as t3.medium, ~10% cheaper
+  NodeMin:
+    Type: Number
+    Default: 1
+  NodeMax:
+    Type: Number
+    Default: 2
+  NodeDesired:
+    Type: Number
+    Default: 1
+  EKSOptimisedAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/eks/optimized-ami/1.32/amazon-linux-2/recommended/image_id
+
+Resources:
+  # ── Launch Template ────────────────────────────────────────────────────────
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-eks-node-lt
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20          # 20 GB is enough; was 50 GB before
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required        # IMDSv2 — blocks SSRF metadata attacks
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-NodeSGId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: !Sub kubernetes.io/cluster/${EnvironmentName}-eks-cluster
+                Value: owned
+          - ResourceType: volume
+            Tags:
+              - Key: Environment
+                Value: !Ref EnvironmentName
+
+  # ── Single Node Group ──────────────────────────────────────────────────────
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      NodegroupName: !Sub ${EnvironmentName}-ng
+      ClusterName: !ImportValue
+        Fn::Sub: ${EnvironmentName}-ClusterName
+      NodeRole: !ImportValue
+        Fn::Sub: ${EnvironmentName}-EKSNodeGroupRoleArn
+      # Spread across all 3 AZs so the node can be replaced in a healthy AZ
+      # if one AZ has capacity issues — cost is the same (1 node total).
+      Subnets:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PrivateSubnet1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PrivateSubnet2
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-PrivateSubnet3
+      ScalingConfig:
+        MinSize:     !Ref NodeMin
+        MaxSize:     !Ref NodeMax
+        DesiredSize: !Ref NodeDesired
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      AmiType: AL2_x86_64
+      Version: !Ref KubernetesVersion
+      CapacityType: ON_DEMAND
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Labels:
+        role: worker
+        environment: !Ref EnvironmentName
+      Tags:
+        Environment: !Ref EnvironmentName
+      UpdateConfig:
+        MaxUnavailable: 1
+
+Outputs:
+  NodeGroupName:
+    Value: !Ref NodeGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-NodeGroup

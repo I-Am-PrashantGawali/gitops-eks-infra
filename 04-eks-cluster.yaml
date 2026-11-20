@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EKS Cluster with private API endpoint, control plane logging,
+  secrets envelope encryption, and security groups.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+  KubernetesVersion:
+    Type: String
+    Default: '1.32'
+    AllowedValues: ['1.31', '1.32', '1.33']
+  # KMS key for envelope encryption of K8s secrets (create separately or use below)
+  SecretsKMSKeyArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of a KMS key to use for K8s secrets envelope encryption.
+      Leave blank to skip (not recommended for production).
+
+Conditions:
+  HasKMSKey: !Not [!Equals [!Ref SecretsKMSKeyArn, '']]
+
+Resources:
+  # ── KMS Key for Secrets (created here if no ARN provided) ─────────────────
+  EKSSecretsKey:
+    Type: AWS::KMS::Key
+    Condition: HasKMSKey
+    DeletionPolicy: Retain
+    Properties:
+      Description: !Sub EKS secrets encryption key for ${EnvironmentName}
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  # ── Security Group: Cluster control plane ─────────────────────────────────
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS cluster control plane security group
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eks-cluster-sg
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Allow nodes to talk to the control plane API
+  ClusterSGIngressFromNodes:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow worker nodes to reach API server
+
+  # ── Security Group: Worker nodes ──────────────────────────────────────────
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS worker nodes security group
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eks-node-sg
+        - Key: !Sub kubernetes.io/cluster/${EnvironmentName}-eks-cluster
+          Value: owned
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Nodes talk to each other freely
+  NodeSGIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Allow all node-to-node traffic
+
+  # Nodes accept traffic from the control plane
+  NodeSGIngressCluster:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: Allow control plane to communicate with nodes
+
+  NodeSGIngressClusterHTTPS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: Allow control plane HTTPS to nodes
+
+  # Nodes can reach the internet (pull images, call AWS APIs)
+  NodeSGEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      CidrIp: 0.0.0.0/0
+      Description: Allow all outbound
+
+  # ── EKS Cluster ───────────────────────────────────────────────────────────
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub ${EnvironmentName}-eks-cluster
+      Version: !Ref KubernetesVersion
+      RoleArn: !ImportValue
+        Fn::Sub: ${EnvironmentName}-EKSClusterRoleArn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-PrivateSubnet1
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-PrivateSubnet2
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-PrivateSubnet3
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-PublicSubnet1
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-PublicSubnet2
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-PublicSubnet3
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        # Private endpoint: nodes → API server stays inside VPC
+        # Public endpoint: you can still kubectl from your laptop (restrict CIDR below)
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0    # CHANGE THIS to your office/VPN CIDR in production
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      EncryptionConfig: !If
+        - HasKMSKey
+        - - Provider:
+              KeyArn: !Ref SecretsKMSKeyArn
+            Resources:
+              - secrets
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ── EKS Add-ons ───────────────────────────────────────────────────────────
+  VPCCNIAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  CoreDNSAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EBSCSIAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      # ServiceAccountRoleArn is set after OIDC + IRSA roles exist
+      # ServiceAccountRoleArn: !ImportValue ...
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  ClusterName:
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterName
+
+  ClusterArn:
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterArn
+
+  ClusterEndpoint:
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterEndpoint
+
+  ClusterOIDCIssuer:
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterOIDCIssuer
+
+  ClusterSecurityGroupId:
+    Value: !Ref ClusterSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterSGId
+
+  NodeSecurityGroupId:
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-NodeSGId

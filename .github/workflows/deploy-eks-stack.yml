@@ -1,0 +1,81 @@
+name: Deploy EKS CloudFormation Stack
+
+# Triggered manually or on push to main when CloudFormation templates change.
+# Deploys the full EKS infrastructure stack in order.
+#
+# REQUIRED GitHub Secrets:
+#   AWS_ACCESS_KEY_ID         – IAM user/role key with CloudFormation deploy permissions
+#   AWS_SECRET_ACCESS_KEY
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment name (stack prefix)"
+        required: true
+        default: "prod"
+      aws_region:
+        description: "AWS Region"
+        required: true
+        default: "us-east-1"
+      stack:
+        description: "Which stack to deploy (all | vpc | iam | ecr | cluster | nodegroups | oidc | alb)"
+        required: true
+        default: "all"
+
+  push:
+    branches: [main]
+    paths:
+      - "*.yaml"
+      - "post-deploy-k8s/**"
+      - ".github/workflows/deploy-eks-stack.yml"
+
+env:
+  AWS_REGION: ${{ github.event.inputs.aws_region || 'us-east-1' }}
+  ENV_NAME:   ${{ github.event.inputs.environment || 'prod' }}
+
+jobs:
+  lint:
+    name: Lint CloudFormation templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Lint all templates
+        run: |
+          cfn-lint *.yaml --ignore-checks W3002 || true
+
+  deploy:
+    name: Deploy stack — ${{ github.event.inputs.stack || 'push-triggered' }}
+    needs: lint
+    runs-on: ubuntu-latest
+    # Only deploy on manual trigger or push to main
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stacks
+        run: |
+          chmod +x deploy.sh
+          ./deploy.sh "${{ env.ENV_NAME }}" "${{ env.AWS_REGION }}"
+        # deploy.sh handles --no-fail-on-empty-changeset so re-runs are safe
+
+      - name: Apply post-deploy Kubernetes manifests
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ env.ENV_NAME }}-eks-cluster" \
+            --region "${{ env.AWS_REGION }}"
+          kubectl apply -f post-deploy-k8s/ --server-side
+        # ArgoCD also watches post-deploy-k8s/ — this step is a safety net
+        # for the first run before ArgoCD is installed.

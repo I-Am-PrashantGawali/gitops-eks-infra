@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Route53 public hosted zone + IAM IRSA roles for
+  External DNS and cert-manager (DNS-01 challenge).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+  DomainName:
+    Type: String
+    Description: Your domain name e.g. example.com
+  OIDCProviderArn:
+    Type: String
+    Description: EKS OIDC provider ARN
+  OIDCProviderUrl:
+    Type: String
+    Description: EKS OIDC provider URL without https://
+
+Resources:
+  # ── Public Hosted Zone ─────────────────────────────────────────────────────
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub Managed by CloudFormation - ${EnvironmentName}
+      HostedZoneTags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ── IAM Role for External DNS (IRSA) ───────────────────────────────────────
+  ExternalDNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-external-dns-role
+      AssumeRolePolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Federated": "${OIDCProviderArn}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${OIDCProviderUrl}:sub": "system:serviceaccount:external-dns:external-dns",
+                  "${OIDCProviderUrl}:aud": "sts.amazonaws.com"
+                }
+              }
+            }
+          ]
+        }
+      Policies:
+        - PolicyName: ExternalDNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                Resource: !Sub arn:aws:route53:::hostedzone/${HostedZone}
+              - Effect: Allow
+                Action:
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                  - route53:ListTagsForResource
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ── IAM Role for cert-manager DNS-01 challenge (IRSA) ─────────────────────
+  CertManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-cert-manager-role
+      AssumeRolePolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Federated": "${OIDCProviderArn}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${OIDCProviderUrl}:sub": "system:serviceaccount:cert-manager:cert-manager",
+                  "${OIDCProviderUrl}:aud": "sts.amazonaws.com"
+                }
+              }
+            }
+          ]
+        }
+      Policies:
+        - PolicyName: CertManagerRoute53Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # cert-manager needs to create TXT records for DNS-01 challenge
+              - Effect: Allow
+                Action:
+                  - route53:GetChange
+                Resource: arn:aws:route53:::change/*
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListResourceRecordSets
+                Resource: !Sub arn:aws:route53:::hostedzone/${HostedZone}
+              - Effect: Allow
+                Action:
+                  - route53:ListHostedZonesByName
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  HostedZoneId:
+    Value: !Ref HostedZone
+    Export:
+      Name: !Sub ${EnvironmentName}-HostedZoneId
+
+  HostedZoneName:
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub ${EnvironmentName}-HostedZoneName
+
+  NameServers:
+    Value: !Join [', ', !GetAtt HostedZone.NameServers]
+    Description: >
+      Point your domain registrar to these NS records.
+      cert-manager DNS-01 challenge will not work until NS records are live.
+
+  ExternalDNSRoleArn:
+    Value: !GetAtt ExternalDNSRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ExternalDNSRoleArn
+
+  CertManagerRoleArn:
+    Value: !GetAtt CertManagerRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-CertManagerRoleArn

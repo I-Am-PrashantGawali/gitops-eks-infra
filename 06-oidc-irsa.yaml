@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Creates the IAM OIDC Identity Provider for the EKS cluster.
+  Deploy this AFTER the EKS cluster stack, then update the IAM stack with
+  the OIDCProviderArn and OIDCProviderUrl outputs from here.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+
+Resources:
+  # ── OIDC Identity Provider ─────────────────────────────────────────────────
+  # cfnresponse is NOT bundled in Python 3.12 for inline ZipFile code,
+  # so we include the essential parts of it inline.
+  OIDCProviderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-oidc-provider-cr
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt OIDCProviderLambdaRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3
+          import hashlib
+          import json
+          import logging
+          import signal
+          import socket
+          import ssl
+          import urllib.request
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # ── Inline cfnresponse (not bundled in Python 3.12 inline ZipFile) ──
+          SUCCESS = 'SUCCESS'
+          FAILED  = 'FAILED'
+
+          def cfn_send(event, context, status, data=None, physical_resource_id=None):
+              body = {
+                  'Status':             status,
+                  'Reason':             'See CloudWatch log stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': physical_resource_id or context.log_stream_name,
+                  'StackId':            event['StackId'],
+                  'RequestId':          event['RequestId'],
+                  'LogicalResourceId':  event['LogicalResourceId'],
+                  'NoEcho':             False,
+                  'Data':               data or {},
+              }
+              payload = json.dumps(body).encode('utf-8')
+              url     = event['ResponseURL']
+              req     = urllib.request.Request(url, data=payload,
+                            headers={'Content-Type': '', 'Content-Length': len(payload)},
+                            method='PUT')
+              try:
+                  urllib.request.urlopen(req, timeout=10)
+                  logger.info('cfnresponse sent: %s', status)
+              except Exception as e:
+                  logger.error('cfnresponse failed: %s', e)
+
+          # ── Thumbprint helper ─────────────────────────────────────────────
+          def get_thumbprint(oidc_url):
+              hostname = oidc_url.replace('https://', '').split('/')[0]
+              ctx = ssl.create_default_context()
+              with ctx.wrap_socket(
+                  socket.create_connection((hostname, 443), timeout=10),
+                  server_hostname=hostname
+              ) as conn:
+                  cert_der = conn.getpeercert(binary_form=True)
+              return hashlib.sha1(cert_der).hexdigest()
+
+          # ── Handler ───────────────────────────────────────────────────────
+          def handler(event, context):
+              logger.info('Event: %s', json.dumps(event))
+              props        = event['ResourceProperties']
+              cluster_name = props['ClusterName']
+              region       = props['Region']
+              iam = boto3.client('iam')
+              eks = boto3.client('eks', region_name=region)
+
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      cluster  = eks.describe_cluster(name=cluster_name)['cluster']
+                      oidc_url = cluster['identity']['oidc']['issuer']
+                      logger.info('OIDC issuer: %s', oidc_url)
+
+                      thumbprint = get_thumbprint(oidc_url)
+                      logger.info('Thumbprint: %s', thumbprint)
+
+                      # Check if provider already exists
+                      existing     = iam.list_open_id_connect_providers()['OpenIDConnectProviderList']
+                      provider_arn = None
+                      for p in existing:
+                          if oidc_url.replace('https://', '') in p['Arn']:
+                              provider_arn = p['Arn']
+                              logger.info('Existing OIDC provider found: %s', provider_arn)
+                              break
+
+                      if not provider_arn:
+                          resp         = iam.create_open_id_connect_provider(
+                              Url=oidc_url,
+                              ClientIDList=['sts.amazonaws.com'],
+                              ThumbprintList=[thumbprint],
+                          )
+                          provider_arn = resp['OpenIDConnectProviderArn']
+                          logger.info('Created OIDC provider: %s', provider_arn)
+
+                      cfn_send(event, context, SUCCESS, {
+                          'ProviderArn': provider_arn,
+                          'ProviderUrl': oidc_url.replace('https://', ''),
+                      }, provider_arn)
+
+                  elif event['RequestType'] == 'Delete':
+                      physical_id = event.get('PhysicalResourceId', '')
+                      if physical_id.startswith('arn:aws:iam::'):
+                          try:
+                              iam.delete_open_id_connect_provider(
+                                  OpenIDConnectProviderArn=physical_id)
+                              logger.info('Deleted OIDC provider: %s', physical_id)
+                          except iam.exceptions.NoSuchEntityException:
+                              logger.info('OIDC provider already gone: %s', physical_id)
+                      cfn_send(event, context, SUCCESS, {}, physical_id)
+
+              except Exception as e:
+                  logger.exception('Handler error')
+                  cfn_send(event, context, FAILED, {'Error': str(e)}, 'FAILED')
+
+  OIDCProviderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-oidc-cr-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OIDCProviderAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:DeleteOpenIDConnectProvider
+                  - iam:ListOpenIDConnectProviders
+                  - iam:GetOpenIDConnectProvider
+                Resource: '*'
+
+  OIDCProvider:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: OIDCProviderFunction
+    Properties:
+      ServiceToken: !GetAtt OIDCProviderFunction.Arn
+      ClusterName: !ImportValue
+        Fn::Sub: ${EnvironmentName}-ClusterName
+      Region: !Ref AWS::Region
+
+Outputs:
+  OIDCProviderArn:
+    Value: !GetAtt OIDCProvider.ProviderArn
+    Export:
+      Name: !Sub ${EnvironmentName}-OIDCProviderArn
+
+  OIDCProviderUrl:
+    Value: !GetAtt OIDCProvider.ProviderUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-OIDCProviderUrl

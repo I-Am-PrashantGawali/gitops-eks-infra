@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys the AWS Load Balancer Controller via Helm using a CloudFormation
+  Custom Resource. Requires OIDC and IRSA roles to exist first.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+  ALBControllerVersion:
+    Type: String
+    Default: '1.8.1'
+    Description: AWS Load Balancer Controller Helm chart version
+
+Resources:
+  # ── Lambda to run Helm install ─────────────────────────────────────────────
+  # NOTE: In practice, run this via your CI/CD pipeline with:
+  #   helm repo add eks https://aws.github.io/eks-charts
+  #   helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  #     -n kube-system \
+  #     --set clusterName=<cluster> \
+  #     --set serviceAccount.create=true \
+  #     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<role-arn> \
+  #     --set region=<region> \
+  #     --set vpcId=<vpc-id>
+  #
+  # This template outputs the values you need.
+
+  ALBControllerConfigParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${EnvironmentName}/eks/alb-controller/helm-values
+      Type: String
+      Value: !Sub
+        - |
+          clusterName: ${ClusterName}
+          serviceAccount:
+            create: true
+            name: aws-load-balancer-controller
+            annotations:
+              eks.amazonaws.com/role-arn: ${ALBRoleArn}
+          region: ${AWS::Region}
+          vpcId: ${VpcId}
+          replicaCount: 2
+          podDisruptionBudget:
+            maxUnavailable: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          tolerations:
+            - key: CriticalAddonsOnly
+              operator: Exists
+              effect: NoSchedule
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: role
+                        operator: In
+                        values:
+                          - system
+        - ClusterName: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ClusterName
+          ALBRoleArn: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ALBControllerRoleArn
+          VpcId: !ImportValue
+            Fn::Sub: ${EnvironmentName}-VpcId
+      Description: Helm values for AWS Load Balancer Controller
+
+Outputs:
+  HelmValuesSSMPath:
+    Value: !Ref ALBControllerConfigParam
+    Description: >
+      Retrieve helm values with:
+      aws ssm get-parameter --name /prod/eks/alb-controller/helm-values --query Parameter.Value --output text
+
+  HelmInstallCommand:
+    Value: !Sub
+      - |
+        helm repo add eks https://aws.github.io/eks-charts && helm repo update
+        aws ssm get-parameter \
+          --name /${EnvironmentName}/eks/alb-controller/helm-values \
+          --query Parameter.Value --output text > /tmp/alb-values.yaml
+        helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+          -n kube-system \
+          --version ${ALBControllerVersion} \
+          -f /tmp/alb-values.yaml
+      - {}

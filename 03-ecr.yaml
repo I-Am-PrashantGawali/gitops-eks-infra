@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECR repositories with lifecycle policies, image scanning,
+  and cross-account pull access (optional).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+  # Add repo names here, one per application
+  AppName:
+    Type: String
+    Default: my-app
+    Description: Name of your application (creates one repo; repeat stack or add more below)
+  # Optional: account ID allowed to pull images (e.g. a staging account)
+  CrossAccountPullAccountId:
+    Type: String
+    Default: ''
+    Description: AWS account ID that is allowed to pull from these repos (leave blank to disable)
+
+Conditions:
+  HasCrossAccountAccess: !Not [!Equals [!Ref CrossAccountPullAccountId, '']]
+
+Resources:
+  # ── Application ECR Repository ─────────────────────────────────────────────
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${EnvironmentName}/${AppName}
+      ImageTagMutability: IMMUTABLE        # prevent tag overwriting in prod
+      ImageScanningConfiguration:
+        ScanOnPush: true                   # vulnerability scan on every push
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 tagged production images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Remove untagged images older than 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      RepositoryPolicyText: !If
+        - HasCrossAccountAccess
+        - !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "CrossAccountPull",
+                  "Effect": "Allow",
+                  "Principal": {
+                    "AWS": "arn:aws:iam::${CrossAccountPullAccountId}:root"
+                  },
+                  "Action": [
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                    "ecr:BatchCheckLayerAvailability"
+                  ]
+                }
+              ]
+            }
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Application
+          Value: !Ref AppName
+
+  # ── Shared / base-image repository ────────────────────────────────────────
+  BaseImagesRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${EnvironmentName}/base-images
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Remove untagged images older than 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  AppRepositoryUri:
+    Value: !GetAtt AppRepository.RepositoryUri
+    Export:
+      Name: !Sub ${EnvironmentName}-${AppName}-RepoUri
+
+  AppRepositoryArn:
+    Value: !GetAtt AppRepository.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-${AppName}-RepoArn
+
+  BaseImagesRepositoryUri:
+    Value: !GetAtt BaseImagesRepository.RepositoryUri
+    Export:
+      Name: !Sub ${EnvironmentName}-BaseImages-RepoUri
