@@ -20,13 +20,13 @@ Parameters:
       - t3a.medium              # AMD, same spec as t3.medium, ~10% cheaper
   NodeMin:
     Type: Number
-    Default: 1
+    Default: 2
   NodeMax:
     Type: Number
-    Default: 2
+    Default: 3
   NodeDesired:
     Type: Number
-    Default: 1
+    Default: 2
   EKSOptimisedAMI:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/eks/optimized-ami/1.32/amazon-linux-2/recommended/image_id

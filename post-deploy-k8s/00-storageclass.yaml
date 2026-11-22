@@ -27,3 +27,13 @@ reclaimPolicy: Delete
 parameters:
   type: gp2
   encrypted: "true"
+---
+# EBS CSI controller service account — IRSA annotation wires it to the IAM role
+# Role is created by gitops-eks-infra/02-iam.yaml (EBSCSIDriverRole)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebs-csi-controller-sa
+  namespace: kube-system
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::132551339390:role/prod-ebs-csi-driver-role
