@@ -54,6 +54,9 @@ deploy_stack "${STACK_PREFIX}-iam" "02-iam.yaml"
 deploy_stack "${STACK_PREFIX}-ecr" "03-ecr.yaml" \
   "AppName=my-app"
 
+# Deploy portfolio website ECR repository
+deploy_stack "${STACK_PREFIX}-portfolio-ecr" "09-portfolio-ecr.yaml"
+
 # ── STEP 4: EKS Cluster ───────────────────────────────────────────────────────
 # Reuse an existing KMS key alias if present, otherwise create one.
 KMS_ALIAS="alias/${ENV}-eks-secrets"
