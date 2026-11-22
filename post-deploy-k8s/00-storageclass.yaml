@@ -14,7 +14,7 @@ parameters:
   iops: "3000"
   throughput: "125"
 ---
-# Remove the old gp2 default
+# Remove the old gp2 default â€” parameters match what EKS already created (immutable)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -26,9 +26,9 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 parameters:
   type: gp2
-  encrypted: "true"
+  fsType: ext4
 ---
-# EBS CSI controller service account — IRSA annotation wires it to the IAM role
+# EBS CSI controller service account ï¿½ IRSA annotation wires it to the IAM role
 # Role is created by gitops-eks-infra/02-iam.yaml (EBSCSIDriverRole)
 apiVersion: v1
 kind: ServiceAccount
