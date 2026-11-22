@@ -12,7 +12,7 @@ metadata:
   name: cluster-autoscaler
   namespace: kube-system
   annotations:
-    eks.amazonaws.com/role-arn: REPLACE_WITH_CLUSTER_AUTOSCALER_ROLE_ARN
+    eks.amazonaws.com/role-arn: arn:aws:iam::132551339390:role/prod-cluster-autoscaler-role
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -99,7 +99,7 @@ spec:
           operator: Exists
           effect: NoSchedule
       nodeSelector:
-        role: system
+        role: worker
       priorityClassName: system-cluster-critical
       containers:
         - name: cluster-autoscaler
@@ -111,7 +111,7 @@ spec:
             - --cloud-provider=aws
             - --skip-nodes-with-local-storage=false
             - --expander=least-waste
-            - --node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/REPLACE_WITH_CLUSTER_NAME
+            - --node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/prod-eks-cluster
             - --balance-similar-node-groups
             - --skip-nodes-with-system-pods=false
             - --scale-down-delay-after-add=10m
@@ -125,7 +125,7 @@ spec:
               memory: 500Mi
           env:
             - name: AWS_REGION
-              value: REPLACE_WITH_REGION
+              value: us-east-1
           volumeMounts:
             - name: ssl-certs
               mountPath: /etc/ssl/certs/ca-certificates.crt
